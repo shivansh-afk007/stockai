@@ -1,95 +1,136 @@
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import os
+import logging
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd
 from datetime import datetime, timedelta
-import logging
-from typing import List, Dict, Any
-import re
+from typing import List, Dict, Any, Tuple
 import numpy as np
+import pandas as pd
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
-import time
-import json
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+import joblib
+import openai
+from dotenv import load_dotenv
 
+# Load environment variables
+load_dotenv()
+
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class SentimentAnalyzer:
-    """Class for analyzing sentiment of financial news and social media content."""
+class EnhancedSentimentAnalyzer:
+    """Enhanced sentiment analyzer using FinBERT, GPT-4, and Logistic Regression."""
     
-    def __init__(self, model_name: str = "ProsusAI/finbert"):
-        """
-        Initialize the SentimentAnalyzer.
+    def __init__(self):
+        """Initialize the sentiment analyzer with required models."""
+        # Load FinBERT
+        self.finbert_tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+        self.finbert_model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
         
-        Args:
-            model_name: Name of the pre-trained model to use
-        """
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
-            self.model.eval()  # Set model to evaluation mode
+        # Initialize GPT-4
+        openai.api_key = os.getenv("OPENAI_API_KEY")
+        
+        # Initialize or load Logistic Regression model
+        self.model_path = "models/sentiment_model.joblib"
+        self.scaler_path = "models/sentiment_scaler.joblib"
+        
+        if os.path.exists(self.model_path) and os.path.exists(self.scaler_path):
+            self.lr_model = joblib.load(self.model_path)
+            self.scaler = joblib.load(self.scaler_path)
+        else:
+            self.lr_model = LogisticRegression(random_state=42)
+            self.scaler = StandardScaler()
+        
+        # Headers for web scraping
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+
+    def get_finbert_sentiment(self, text: str) -> Dict[str, float]:
+        """Get sentiment scores using FinBERT."""
+        inputs = self.finbert_tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        
+        with torch.no_grad():
+            outputs = self.finbert_model(**inputs)
+            probabilities = torch.nn.functional.softmax(outputs.logits, dim=1)
             
-            # Headers for web scraping
-            self.headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        return {
+            "positive": float(probabilities[0][2]),
+            "neutral": float(probabilities[0][1]),
+            "negative": float(probabilities[0][0])
+        }
+
+    async def get_gpt4_sentiment(self, text: str) -> Dict[str, Any]:
+        """Get sentiment analysis from GPT-4."""
+        try:
+            response = await openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a financial sentiment analyzer. Analyze the following text and provide sentiment scores and key points."},
+                    {"role": "user", "content": text}
+                ],
+                temperature=0.3,
+                max_tokens=150
+            )
+            
+            # Extract sentiment from GPT-4's response
+            analysis = response.choices[0].message.content
+            
+            # Parse GPT-4's response to extract sentiment scores
+            # This is a simplified version - you might want to make it more sophisticated
+            sentiment_scores = {
+                "positive": 0.0,
+                "neutral": 0.0,
+                "negative": 0.0
             }
             
-        except Exception as e:
-            logger.error(f"Error initializing SentimentAnalyzer: {str(e)}")
-            raise
-    
-    def analyze_text(self, text: str) -> Dict[str, Any]:
-        """
-        Analyze sentiment of a single text.
-        
-        Args:
-            text: Text to analyze
-            
-        Returns:
-            Dictionary containing sentiment scores
-        """
-        try:
-            # Tokenize text
-            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-            
-            # Get model outputs
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
-            
-            # Convert predictions to probabilities
-            positive_score = predictions[0][0].item()
-            negative_score = predictions[0][1].item()
-            neutral_score = predictions[0][2].item()
-            
-            # Determine sentiment label
-            sentiment = "positive" if positive_score > max(negative_score, neutral_score) else \
-                       "negative" if negative_score > max(positive_score, neutral_score) else "neutral"
-            
+            if "positive" in analysis.lower():
+                sentiment_scores["positive"] = 0.7
+            elif "negative" in analysis.lower():
+                sentiment_scores["negative"] = 0.7
+            else:
+                sentiment_scores["neutral"] = 0.7
+                
             return {
-                "sentiment": sentiment,
-                "scores": {
-                    "positive": positive_score,
-                    "negative": negative_score,
-                    "neutral": neutral_score
-                }
+                "scores": sentiment_scores,
+                "analysis": analysis
             }
             
         except Exception as e:
-            logger.error(f"Error analyzing text: {str(e)}")
-            raise
-    
-    def scrape_news(self, company_name: str, days: int = 7) -> List[Dict[str, str]]:
-        """
-        Scrape financial news for a company.
-        
-        Args:
-            company_name: Name of the company
-            days: Number of days of news to fetch
+            logger.error(f"Error getting GPT-4 sentiment: {str(e)}")
+            return {
+                "scores": {"positive": 0.33, "neutral": 0.34, "negative": 0.33},
+                "analysis": "Error analyzing sentiment"
+            }
+
+    def combine_sentiments(self, finbert_scores: Dict[str, float], gpt4_scores: Dict[str, float]) -> np.ndarray:
+        """Combine FinBERT and GPT-4 scores for Logistic Regression."""
+        features = [
+            finbert_scores["positive"], finbert_scores["neutral"], finbert_scores["negative"],
+            gpt4_scores["positive"], gpt4_scores["neutral"], gpt4_scores["negative"]
+        ]
+        return np.array(features).reshape(1, -1)
+
+    def predict_market_movement(self, combined_features: np.ndarray) -> Tuple[str, float]:
+        """Predict market movement using Logistic Regression."""
+        if not hasattr(self.lr_model, 'coef_'):
+            # If model is not trained, return neutral prediction
+            return "HOLD", 0.5
             
-        Returns:
-            List of dictionaries containing news articles
-        """
+        scaled_features = self.scaler.transform(combined_features)
+        prediction = self.lr_model.predict(scaled_features)
+        probability = self.lr_model.predict_proba(scaled_features)
+        
+        if prediction[0] == 1:
+            return "BUY", float(probability[0][1])
+        else:
+            return "SELL", float(probability[0][0])
+
+    def scrape_news(self, company_name: str, days: int = 7) -> List[Dict[str, str]]:
+        """Scrape financial news for a company."""
         try:
             # Format search query
             query = f"{company_name} stock news"
@@ -102,62 +143,39 @@ class SentimentAnalyzer:
             response = requests.get(url, headers=self.headers)
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Extract news articles
+            # Find news articles
             articles = []
             for article in soup.select('article'):
                 try:
-                    # Find title and link
-                    title_elem = article.select_one('h3 a')
-                    if title_elem and title_elem.text:
-                        title = title_elem.text.strip()
-                        link = "https://news.google.com" + title_elem['href'][1:]
+                    title_elem = article.select_one('h3 > a')
+                    if not title_elem:
+                        continue
                         
-                        # Find date
-                        time_elem = article.select_one('time')
-                        date = time_elem['datetime'] if time_elem else datetime.now().strftime('%Y-%m-%d')
-                        
-                        articles.append({
-                            "title": title,
-                            "link": link,
-                            "date": date
-                        })
+                    title = title_elem.text
+                    link = "https://news.google.com" + title_elem['href'][1:]
+                    
+                    # Get date if available
+                    date_elem = article.select_one('time')
+                    date = date_elem['datetime'] if date_elem else None
+                    
+                    articles.append({
+                        "title": title,
+                        "link": link,
+                        "date": date
+                    })
+                    
                 except Exception as e:
-                    logger.warning(f"Error parsing article: {str(e)}")
+                    logger.error(f"Error parsing article: {str(e)}")
                     continue
-            
-            # If no articles found through Google News, use a fallback source
-            if not articles:
-                articles = [
-                    {
-                        "title": f"Latest market update for {company_name}",
-                        "link": f"https://www.google.com/search?q={query}",
-                        "date": datetime.now().strftime('%Y-%m-%d')
-                    }
-                ]
-            
+                    
             return articles[:10]  # Return top 10 articles
             
         except Exception as e:
             logger.error(f"Error scraping news: {str(e)}")
-            # Return a default article if scraping fails
-            return [
-                {
-                    "title": f"Market analysis for {company_name}",
-                    "link": f"https://www.google.com/search?q={query}",
-                    "date": datetime.now().strftime('%Y-%m-%d')
-                }
-            ]
-    
-    def analyze_news_sentiment(self, company_name: str) -> Dict[str, Any]:
-        """
-        Analyze sentiment of recent news articles about a company.
-        
-        Args:
-            company_name: Name of the company
-            
-        Returns:
-            Dictionary containing aggregated sentiment analysis
-        """
+            return []
+
+    async def analyze_news_sentiment(self, company_name: str) -> Dict[str, Any]:
+        """Analyze sentiment from news articles using multiple models."""
         try:
             # Scrape news articles
             articles = self.scrape_news(company_name)
@@ -165,185 +183,86 @@ class SentimentAnalyzer:
             if not articles:
                 return {
                     "overall_sentiment": "neutral",
-                    "sentiment_scores": {"positive": 0, "negative": 0, "neutral": 0},
+                    "sentiment_scores": {"positive": 0.33, "neutral": 0.34, "negative": 0.33},
+                    "market_prediction": "HOLD",
+                    "confidence": 0.5,
                     "articles": []
                 }
             
-            # Analyze sentiment for each article
+            # Analyze each article
             analyzed_articles = []
-            sentiment_counts = {"positive": 0, "negative": 0, "neutral": 0}
+            total_finbert_scores = {"positive": 0.0, "neutral": 0.0, "negative": 0.0}
+            total_gpt4_scores = {"positive": 0.0, "neutral": 0.0, "negative": 0.0}
             
             for article in articles:
-                sentiment_result = self.analyze_text(article["title"])
-                sentiment_counts[sentiment_result["sentiment"]] += 1
+                # Get FinBERT sentiment
+                finbert_scores = self.get_finbert_sentiment(article["title"])
                 
-                analyzed_articles.append({
-                    "title": article["title"],
-                    "sentiment": sentiment_result["sentiment"],
-                    "scores": sentiment_result["scores"],
-                    "date": article["date"],
-                    "link": article["link"]
-                })
+                # Get GPT-4 sentiment
+                gpt4_result = await self.get_gpt4_sentiment(article["title"])
+                gpt4_scores = gpt4_result["scores"]
+                
+                # Combine scores for overall article sentiment
+                for sentiment in ["positive", "neutral", "negative"]:
+                    total_finbert_scores[sentiment] += finbert_scores[sentiment]
+                    total_gpt4_scores[sentiment] += gpt4_scores[sentiment]
+                
+                # Get market prediction for this article
+                combined_features = self.combine_sentiments(finbert_scores, gpt4_scores)
+                prediction, confidence = self.predict_market_movement(combined_features)
+                
+                # Add analyzed article
+                article["sentiment"] = prediction
+                article["confidence"] = confidence
+                article["analysis"] = gpt4_result["analysis"]
+                analyzed_articles.append(article)
             
-            # Calculate overall sentiment
-            total_articles = len(analyzed_articles)
-            sentiment_scores = {
-                k: v / total_articles for k, v in sentiment_counts.items()
-            }
+            # Calculate average scores
+            num_articles = len(articles)
+            avg_finbert_scores = {k: v/num_articles for k, v in total_finbert_scores.items()}
+            avg_gpt4_scores = {k: v/num_articles for k, v in total_gpt4_scores.items()}
             
-            overall_sentiment = max(sentiment_scores.items(), key=lambda x: x[1])[0]
+            # Get overall market prediction
+            combined_features = self.combine_sentiments(avg_finbert_scores, avg_gpt4_scores)
+            overall_prediction, overall_confidence = self.predict_market_movement(combined_features)
+            
+            # Determine overall sentiment
+            max_sentiment = max(avg_finbert_scores.items(), key=lambda x: x[1])[0]
             
             return {
-                "overall_sentiment": overall_sentiment,
-                "sentiment_scores": sentiment_scores,
+                "overall_sentiment": max_sentiment,
+                "sentiment_scores": avg_finbert_scores,
+                "market_prediction": overall_prediction,
+                "confidence": overall_confidence,
                 "articles": analyzed_articles
             }
             
         except Exception as e:
             logger.error(f"Error analyzing news sentiment: {str(e)}")
-            raise
-
-    def clean_text(self, text: str) -> str:
-        """Clean and preprocess text."""
-        # Remove URLs
-        text = re.sub(r'http\S+|www.\S+', '', text)
-        # Remove special characters and extra whitespace
-        text = re.sub(r'[^\w\s]', ' ', text)
-        text = ' '.join(text.split())
-        return text
-
-    def get_news_articles(self, symbol: str, max_articles: int = 10) -> List[Dict[str, str]]:
-        """
-        Fetch news articles for a given stock symbol.
-        
-        Args:
-            symbol (str): Stock symbol
-            max_articles (int): Maximum number of articles to fetch
-            
-        Returns:
-            list: List of dictionaries containing article information
-        """
-        try:
-            # Check cache
-            cache_key = f"{symbol}_news"
-            if (cache_key in self.news_cache and 
-                datetime.now() - self.cache_timestamp[cache_key] < self.cache_duration):
-                return self.news_cache[cache_key]
-
-            # Example URLs for financial news (you would need to implement proper news API integration)
-            # This is a placeholder - in production, use proper financial news APIs
-            news_sources = [
-                f"https://economictimes.indiatimes.com/{symbol}/stocks/news",
-                f"https://www.moneycontrol.com/stocks/{symbol}/news"
-            ]
-            
-            articles = []
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-
-            for url in news_sources:
-                try:
-                    response = requests.get(url, headers=headers, timeout=10)
-                    if response.status_code == 200:
-                        soup = BeautifulSoup(response.text, 'html.parser')
-                        # Extract articles (implementation depends on website structure)
-                        # This is a placeholder implementation
-                        for article in soup.find_all('article')[:max_articles//2]:
-                            title = article.find('h2')
-                            if title:
-                                articles.append({
-                                    'title': self.clean_text(title.text),
-                                    'date': datetime.now().strftime('%Y-%m-%d'),
-                                    'source': url
-                                })
-                except Exception as e:
-                    logger.warning(f"Error fetching news from {url}: {str(e)}")
-                    continue
-
-            # Cache the results
-            self.news_cache[cache_key] = articles
-            self.cache_timestamp[cache_key] = datetime.now()
-            
-            return articles[:max_articles]
-            
-        except Exception as e:
-            logger.error(f"Error fetching news articles: {str(e)}")
-            return []
-
-    def analyze_sentiment(self, texts: List[str]) -> List[Dict[str, Any]]:
-        """
-        Analyze sentiment of given texts.
-        
-        Args:
-            texts (list): List of texts to analyze
-            
-        Returns:
-            list: List of sentiment analysis results
-        """
-        try:
-            results = []
-            for text in texts:
-                if not text:
-                    continue
-                    
-                sentiment = self.sentiment_analyzer(text)[0]
-                results.append({
-                    'text': text,
-                    'sentiment': sentiment['label'],
-                    'score': sentiment['score']
-                })
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error analyzing sentiment: {str(e)}")
-            return []
-
-    def get_stock_sentiment(self, symbol: str) -> Dict[str, Any]:
-        """
-        Get overall sentiment analysis for a stock.
-        
-        Args:
-            symbol (str): Stock symbol
-            
-        Returns:
-            dict: Dictionary containing sentiment analysis results
-        """
-        try:
-            # Get news articles
-            articles = self.get_news_articles(symbol)
-            if not articles:
-                return {'error': 'No articles found'}
-
-            # Analyze sentiment of article titles
-            titles = [article['title'] for article in articles]
-            sentiments = self.analyze_sentiment(titles)
-
-            # Calculate overall sentiment
-            sentiment_scores = {
-                'positive': 0,
-                'negative': 0,
-                'neutral': 0
-            }
-
-            for sentiment in sentiments:
-                sentiment_scores[sentiment['sentiment'].lower()] += 1
-
-            total = len(sentiments)
-            sentiment_distribution = {
-                k: v/total for k, v in sentiment_scores.items()
-            }
-
-            # Determine overall sentiment
-            overall_sentiment = max(sentiment_distribution.items(), key=lambda x: x[1])[0]
-
             return {
-                'overall_sentiment': overall_sentiment,
-                'sentiment_distribution': sentiment_distribution,
-                'detailed_analysis': sentiments,
-                'articles': articles
+                "overall_sentiment": "neutral",
+                "sentiment_scores": {"positive": 0.33, "neutral": 0.34, "negative": 0.33},
+                "market_prediction": "HOLD",
+                "confidence": 0.5,
+                "articles": []
             }
+
+    def train_model(self, X_train: np.ndarray, y_train: np.ndarray):
+        """Train the Logistic Regression model with historical data."""
+        try:
+            # Scale features
+            X_scaled = self.scaler.fit_transform(X_train)
+            
+            # Train model
+            self.lr_model.fit(X_scaled, y_train)
+            
+            # Save model and scaler
+            os.makedirs("models", exist_ok=True)
+            joblib.dump(self.lr_model, self.model_path)
+            joblib.dump(self.scaler, self.scaler_path)
             
         except Exception as e:
-            logger.error(f"Error getting stock sentiment: {str(e)}")
-            return {'error': str(e)} 
+            logger.error(f"Error training model: {str(e)}")
+
+# Create singleton instance
+sentiment_analyzer = EnhancedSentimentAnalyzer() 
